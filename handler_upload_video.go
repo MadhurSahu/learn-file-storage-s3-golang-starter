@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -100,9 +103,16 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	orientation, err := getVideoOrientation(videoFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get video orientation", err)
+		return
+	}
+
+	videoKeyName := fmt.Sprintf("%s/%s", orientation, videoName)
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
-		Key:         &videoName,
+		Key:         &videoKeyName,
 		Body:        videoFile,
 		ContentType: &mediaType,
 	})
@@ -111,7 +121,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, videoName)
+	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, videoKeyName)
 	video.VideoURL = &videoURL
 
 	err = cfg.db.UpdateVideo(video)
@@ -121,4 +131,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoOrientation(filePath string) (string, error) {
+	type VideoStream struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+	var data bytes.Buffer
+	var videoStream VideoStream
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	cmd.Stdout = &data
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	err = json.Unmarshal(data.Bytes(), &videoStream)
+	if err != nil {
+		return "", err
+	}
+
+	if len(videoStream.Streams) == 0 {
+		return "", fmt.Errorf("no streams found")
+	}
+
+	aspectRatio := videoStream.Streams[0].Width / videoStream.Streams[0].Height
+	switch aspectRatio {
+	case 16 / 9:
+		return "landscape", nil
+	case 9 / 16:
+		return "portrait", nil
+	default:
+		return "other", nil
+	}
 }
